@@ -1,0 +1,435 @@
+"""
+XRD Defect Classification
+===========================================================
+Input  : XLS/XLSX file from any XRD software
+         Column 1 = 2θ (degrees), Column 2 = Intensity (counts)
+Output : Defect class per peak + full visualization
+
+Instrument : Rigaku MiniFlex (or compatible), CuKα radiation
+Wavelength : 1.540593 Å (CuKα1)
+Dataset    : sample_1 — 10–80°, step 0.01°, 7001 points
+
+Classes detected:
+  Perfect_Crystal           → FWHM < 0.03°, crystallite > 30,000 nm
+  StackingFault             → moderate FWHM 0.03–0.45°, mid crystallite
+  Dislocation_GrainBoundary → high strain > 0.025 or small crystallite < 2000 nm
+  Amorphous_Disorder        → FWHM > 0.7° or strain > 0.07
+
+Requirements:
+  pip install scikit-learn numpy pandas matplotlib scipy openpyxl
+  (for .xls files: convert with LibreOffice first, or install xlrd)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.lines import Line2D
+from scipy.signal import find_peaks, peak_widths
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             ConfusionMatrixDisplay, accuracy_score, f1_score)
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# ══════════════════════════════════════════════════════════════
+#  CONFIGURATION — EDIT FOR YOUR FILE
+# ══════════════════════════════════════════════════════════════
+
+XRD_FILE        = "sample_1.xlsx"    # path to your XLS/XLSX file
+SHEET_INDEX     = 0                   # sheet index (0 = first sheet)
+WAVELENGTH      = 1.540593            # CuKα1 in Angstrom (change for other targets)
+SCHERRER_K      = 0.9                 # shape factor (0.9 for spherical crystallites)
+BG_WINDOW       = 300                 # rolling background window (data points)
+PEAK_MIN_HEIGHT = 500                 # minimum net height above background to count as peak
+PEAK_PROMINENCE = 300                 # minimum peak prominence
+PEAK_MIN_DIST   = 15                  # minimum distance between peaks (data points)
+TEST_SIZE       = 0.25                # train/test split fraction
+RANDOM_STATE    = 42
+
+# Class colors for plots
+PALETTE = {
+    'Perfect_Crystal':            '#185FA5',
+    'StackingFault':              '#3B6D11',
+    'Dislocation_GrainBoundary':  '#854F0B',
+    'Amorphous_Disorder':         '#A32D2D',
+}
+
+
+# ══════════════════════════════════════════════════════════════
+#  STEP 1 — LOAD XRD DATA
+# ══════════════════════════════════════════════════════════════
+
+def load_xrd(filepath, sheet=0):
+    """
+    Load 2θ / intensity data from XLS or XLSX.
+    Expects column 0 = 2θ, column 1 = Intensity.
+    """
+    df = pd.read_excel(filepath, sheet_name=sheet, header=0)
+    df.columns = ['two_theta', 'intensity']
+    df = df.dropna()
+    df = df.astype(float)
+    print(f"  Loaded {len(df)} data points")
+    print(f"  2θ range : {df.two_theta.min():.3f}° – {df.two_theta.max():.3f}°")
+    print(f"  Intensity: {df.intensity.min():.0f} – {df.intensity.max():.0f} counts")
+    step = df.two_theta.diff().median()
+    print(f"  Step size: {step:.4f}°")
+    return df.two_theta.values, df.intensity.values.astype(float), step
+
+
+# ══════════════════════════════════════════════════════════════
+#  STEP 2 — BACKGROUND SUBTRACTION
+# ══════════════════════════════════════════════════════════════
+
+def rolling_background(y, window=BG_WINDOW):
+    """10th-percentile rolling background estimation."""
+    bg = np.zeros_like(y, dtype=float)
+    half = window // 2
+    for i in range(len(y)):
+        lo, hi = max(0, i-half), min(len(y), i+half)
+        bg[i] = np.percentile(y[lo:hi], 10)
+    return bg
+
+
+# ══════════════════════════════════════════════════════════════
+#  STEP 3 — PEAK DETECTION & FEATURE EXTRACTION
+# ══════════════════════════════════════════════════════════════
+
+def extract_peak_features(two_theta, intensity, bg, step):
+    """
+    Detect peaks and compute 11 XRD features per peak.
+    Returns a DataFrame where each row = one peak.
+    """
+    net = intensity - bg
+    peaks, _ = find_peaks(net,
+                          height=PEAK_MIN_HEIGHT,
+                          prominence=PEAK_PROMINENCE,
+                          distance=PEAK_MIN_DIST)
+    print(f"  {len(peaks)} peaks detected")
+
+    widths_result = peak_widths(intensity, peaks, rel_height=0.5)
+    fwhm_deg = widths_result[0] * step
+
+    records = []
+    for i, p in enumerate(peaks):
+        tth   = two_theta[p]
+        I     = float(intensity[p])
+        fwhm  = max(float(fwhm_deg[i]), 1e-4)
+        theta = np.radians(tth / 2)
+        bg_I  = float(bg[p])
+        net_I = float(net[p])
+
+        # Bragg law: d = λ / (2 sinθ)
+        d_sp  = WAVELENGTH / (2 * np.sin(theta))
+
+        # Scherrer equation: D = Kλ / (β cosθ), β in radians → nm
+        beta  = np.radians(fwhm)
+        cryst = (SCHERRER_K * WAVELENGTH) / (beta * np.cos(theta)) * 10
+
+        # Simplified Williamson-Hall strain
+        strain = (fwhm / 4) * np.tan(theta)
+
+        # Peak asymmetry
+        asym = abs(widths_result[2][i] - (p - widths_result[0][i]/2)) / max(widths_result[0][i], 1)
+
+        # Local SNR
+        noise = float(np.std(intensity[max(0, p-30):p-5])) if p > 35 else 100.0
+
+        records.append({
+            'peak_id':                  i + 1,
+            'peak_position_2theta':     round(tth,   4),
+            'peak_intensity_counts':    round(I,      1),
+            'net_intensity':            round(net_I,  1),
+            'background_intensity':     round(bg_I,   1),
+            'fwhm_deg':                 round(fwhm,   5),
+            'd_spacing_angstrom':       round(d_sp,   5),
+            'crystallite_size_nm':      round(cryst,  3),
+            'lattice_strain_epsilon':   round(strain, 6),
+            'peak_asymmetry':           round(asym,   5),
+            'texture_coefficient':      round(I / max(bg_I, 1), 4),
+            'integral_breadth':         round(fwhm * 1.064, 5),
+            'snr':                      round(net_I / max(noise, 1), 3),
+        })
+
+    return pd.DataFrame(records), peaks
+
+
+# ══════════════════════════════════════════════════════════════
+#  STEP 4 — PHYSICS-BASED DEFECT LABELING
+#  Calibrated to sample_1 intensity / FWHM / strain ranges
+# ══════════════════════════════════════════════════════════════
+
+def label_peaks(df_pk):
+    """
+    Assign defect class to each peak based on XRD peak parameters.
+    Thresholds are tuned to sample_1 data characteristics.
+    Adjust thresholds if your data has different intensity scales.
+    """
+    def label(r):
+        fwhm   = r['fwhm_deg']
+        cryst  = r['crystallite_size_nm']
+        strain = r['lattice_strain_epsilon']
+
+        if fwhm < 0.03 and cryst > 30000:
+            return 'Perfect_Crystal'
+        elif fwhm > 0.7 or strain > 0.07:
+            return 'Amorphous_Disorder'
+        elif strain > 0.025 or cryst < 2000:
+            return 'Dislocation_GrainBoundary'
+        else:
+            return 'StackingFault'
+
+    df_pk['defect_class'] = df_pk.apply(label, axis=1)
+    print("\n  Class distribution:")
+    print(df_pk['defect_class'].value_counts().to_string())
+    return df_pk
+
+
+# ══════════════════════════════════════════════════════════════
+#  STEP 5 — TRAIN ML MODELS
+# ══════════════════════════════════════════════════════════════
+
+FEATURE_COLS = [
+    'peak_position_2theta', 'peak_intensity_counts', 'net_intensity',
+    'fwhm_deg', 'd_spacing_angstrom', 'crystallite_size_nm',
+    'lattice_strain_epsilon', 'peak_asymmetry', 'texture_coefficient',
+    'integral_breadth', 'snr'
+]
+
+def train_models(df_pk):
+    X  = df_pk[FEATURE_COLS].values
+    le = LabelEncoder()
+    y  = le.fit_transform(df_pk['defect_class'].values)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+    )
+    scaler = StandardScaler()
+    Xtr = scaler.fit_transform(X_train)
+    Xte = scaler.transform(X_test)
+
+    models = {
+        'Random Forest':        RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE),
+        'SVM (RBF)':            SVC(kernel='rbf', C=10, gamma='scale', probability=True, random_state=RANDOM_STATE),
+        'KNN':                  KNeighborsClassifier(n_neighbors=3),
+        'Decision Tree':        DecisionTreeClassifier(max_depth=6, random_state=RANDOM_STATE),
+        'Logistic Regression':  LogisticRegression(max_iter=2000, random_state=RANDOM_STATE),
+    }
+
+    cv_splitter = StratifiedKFold(n_splits=4, shuffle=True, random_state=RANDOM_STATE)
+    results = {}
+    print(f"\n  {'Model':<22} {'Test Acc':>9} {'F1':>8} {'CV Mean':>9} {'CV Std':>8}")
+    print("  " + "-"*60)
+    for name, model in models.items():
+        model.fit(Xtr, y_train)
+        yp  = model.predict(Xte)
+        acc = accuracy_score(y_test, yp)
+        f1  = f1_score(y_test, yp, average='weighted')
+        cv  = cross_val_score(model, Xtr, y_train, cv=cv_splitter, scoring='accuracy')
+        results[name] = {'model': model, 'acc': acc, 'f1': f1,
+                         'cv': cv.mean(), 'cv_std': cv.std(), 'yp': yp}
+        print(f"  {name:<22} {acc*100:>8.2f}% {f1*100:>7.2f}% {cv.mean()*100:>8.2f}% {cv.std()*100:>7.2f}%")
+
+    best_name = max(results, key=lambda k: results[k]['acc'])
+    print(f"\n  Best model: {best_name}")
+    print(classification_report(y_test, results[best_name]['yp'], target_names=le.classes_))
+
+    return results, best_name, le, scaler
+
+
+# ══════════════════════════════════════════════════════════════
+#  STEP 6 — PREDICT A SINGLE NEW SAMPLE
+# ══════════════════════════════════════════════════════════════
+
+def predict_sample(model, scaler, le, measurement: dict):
+    """
+    Classify a single peak measurement.
+
+    Example usage:
+        measurement = {
+            'peak_position_2theta':   36.26,
+            'peak_intensity_counts':  28299,
+            'net_intensity':          24500,
+            'fwhm_deg':               0.406,
+            'd_spacing_angstrom':     2.475,
+            'crystallite_size_nm':    2056.9,
+            'lattice_strain_epsilon': 0.0333,
+            'peak_asymmetry':         0.001,
+            'texture_coefficient':    9.43,
+            'integral_breadth':       0.432,
+            'snr':                    45.2,
+        }
+        label, proba = predict_sample(best_model, scaler, le, measurement)
+    """
+    x = np.array([[measurement.get(f, 0.0) for f in FEATURE_COLS]])
+    x_s = scaler.transform(x)
+    pred  = model.predict(x_s)[0]
+    proba = model.predict_proba(x_s)[0]
+    label = le.inverse_transform([pred])[0]
+    print(f"\n  Predicted class : {label}")
+    print(f"  Confidence      : {max(proba)*100:.1f}%")
+    for cls, p in sorted(zip(le.classes_, proba), key=lambda x: -x[1]):
+        bar = '█' * int(p * 30)
+        print(f"    {cls:<30} {p*100:5.1f}%  {bar}")
+    return label, proba
+
+
+# ══════════════════════════════════════════════════════════════
+#  STEP 7 — VISUALIZATION
+# ══════════════════════════════════════════════════════════════
+
+def plot_results(two_theta, intensity, bg, peaks, df_pk,
+                 results, best_name, le, scaler):
+    fig = plt.figure(figsize=(20, 15))
+    fig.patch.set_facecolor('#FAFAF8')
+    fig.suptitle(f'XRD Defect Classification — {XRD_FILE}\n'
+                 f'(CuKα, λ={WAVELENGTH} Å)',
+                 fontsize=13, fontweight='bold', y=0.99)
+
+    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.38)
+
+    # (A) XRD pattern with classified peaks
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(two_theta, intensity, color='#2C2C2A', lw=0.7, label='Pattern', zorder=3)
+    ax1.fill_between(two_theta, bg, alpha=0.25, color='#854F0B', label='Background')
+    for i, p in enumerate(peaks):
+        col = PALETTE.get(df_pk['defect_class'].iloc[i], '#888888')
+        ax1.axvline(two_theta[p], color=col, alpha=0.35, lw=0.8)
+        ax1.plot(two_theta[p], intensity[p] + intensity.max()*0.015, 'v', color=col, markersize=5, zorder=5)
+        ax1.text(two_theta[p], intensity[p] + intensity.max()*0.04,
+                 f"{two_theta[p]:.1f}°", fontsize=5.5, ha='center',
+                 color=col, rotation=90, va='bottom')
+    legend_els = [Line2D([0],[0],color='#2C2C2A',lw=1,label='XRD pattern'),
+                  Line2D([0],[0],color='#854F0B',lw=1,alpha=0.5,label='Background')]
+    for cls, col in PALETTE.items():
+        legend_els.append(Line2D([0],[0],marker='v',color='w',markerfacecolor=col,
+                                 markersize=8, label=cls.replace('_',' ')))
+    ax1.legend(handles=legend_els, fontsize=8, loc='upper right', ncol=3)
+    ax1.set_xlabel('2θ (degrees)'); ax1.set_ylabel('Intensity (counts)')
+    ax1.set_title(f'{len(peaks)} peaks detected & classified')
+    ax1.set_xlim(two_theta.min(), two_theta.max())
+
+    # (B) Model comparison
+    ax2 = fig.add_subplot(gs[1, 0])
+    names = list(results.keys()); shorts = ['RF','SVM','KNN','DT','LR']
+    accs = [results[n]['acc']*100 for n in names]
+    cvs  = [results[n]['cv']*100  for n in names]
+    x = np.arange(len(names)); w = 0.38
+    b1 = ax2.bar(x-w/2, accs, w, label='Test acc', color='#185FA5', alpha=0.85)
+    b2 = ax2.bar(x+w/2, cvs,  w, label='CV mean',  color='#3B6D11', alpha=0.85)
+    ax2.set_xticks(x); ax2.set_xticklabels(shorts, fontsize=8)
+    ax2.set_ylim(0,110); ax2.set_ylabel('Accuracy (%)'); ax2.set_title('Model accuracy')
+    ax2.legend(fontsize=8)
+    for b, v in zip(b1, accs): ax2.text(b.get_x()+b.get_width()/2, v+1, f'{v:.0f}%', ha='center', fontsize=7)
+
+    # (C) Confusion matrix
+    ax3 = fig.add_subplot(gs[1, 1])
+    yf = best_model.predict(scaler.transform(df_pk[FEATURE_COLS].values))
+    cm = confusion_matrix(le.transform(df_pk['defect_class']), yf)
+    short_labels = [c.replace('_',' ')[:10] for c in le.classes_]
+    ConfusionMatrixDisplay(cm, display_labels=short_labels).plot(ax=ax3, colorbar=False, cmap='Blues')
+    ax3.set_title(f'Confusion matrix ({best_name})', fontsize=9)
+    plt.setp(ax3.get_xticklabels(), fontsize=7, rotation=30, ha='right')
+    plt.setp(ax3.get_yticklabels(), fontsize=7)
+
+    # (D) Feature importance
+    ax4 = fig.add_subplot(gs[1, 2])
+    rf = results['Random Forest']['model']
+    fi_sorted = sorted(zip(FEATURE_COLS, rf.feature_importances_), key=lambda x: -x[1])
+    fnames = [f[0].replace('_',' ') for f in fi_sorted]
+    fimps  = [f[1]*100 for f in fi_sorted]
+    cols_fi = ['#185FA5' if v > 12 else '#3B6D11' if v > 5 else '#AAAAAA' for v in fimps]
+    ax4.barh(fnames, fimps, color=cols_fi); ax4.invert_yaxis()
+    ax4.set_xlabel('Importance (%)'); ax4.set_title('Feature importance (RF)')
+    ax4.tick_params(axis='y', labelsize=7.5)
+
+    # (E) Class distribution
+    ax5 = fig.add_subplot(gs[2, 0])
+    vc = df_pk['defect_class'].value_counts()
+    ax5.pie(vc.values, labels=[c.replace('_',' ') for c in vc.index],
+            autopct='%1.1f%%', colors=[PALETTE[c] for c in vc.index],
+            startangle=90, textprops={'fontsize': 8})
+    ax5.set_title('Defect class distribution')
+
+    # (F) FWHM vs Strain scatter
+    ax6 = fig.add_subplot(gs[2, 1])
+    for cls, col in PALETTE.items():
+        mask = df_pk['defect_class'] == cls
+        ax6.scatter(df_pk.loc[mask,'fwhm_deg'], df_pk.loc[mask,'lattice_strain_epsilon'],
+                    c=col, s=70, alpha=0.85, label=cls.replace('_',' '), edgecolors='white', lw=0.5)
+    ax6.set_xlabel('FWHM (°)'); ax6.set_ylabel('Lattice strain ε')
+    ax6.set_title('FWHM vs Lattice strain'); ax6.legend(fontsize=7)
+
+    # (G) d-spacing vs log crystallite size
+    ax7 = fig.add_subplot(gs[2, 2])
+    for cls, col in PALETTE.items():
+        mask = df_pk['defect_class'] == cls
+        ax7.scatter(df_pk.loc[mask,'d_spacing_angstrom'],
+                    np.log10(df_pk.loc[mask,'crystallite_size_nm']),
+                    c=col, s=70, alpha=0.85, label=cls.replace('_',' '), edgecolors='white', lw=0.5)
+    ax7.set_xlabel('d-spacing (Å)'); ax7.set_ylabel('log₁₀(Crystallite size / nm)')
+    ax7.set_title('d-spacing vs Crystallite size'); ax7.legend(fontsize=7)
+
+    plt.savefig('xrd_defect_results.png', dpi=160, bbox_inches='tight')
+    print("\n  Plot saved: xrd_defect_results.png")
+    plt.show()
+
+
+# ══════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("  XRD Defect Classifier — sample_1 format")
+    print("=" * 60)
+
+    print("\n[1] Loading XRD data...")
+    two_theta, intensity, step = load_xrd(XRD_FILE, SHEET_INDEX)
+
+    print("\n[2] Background subtraction...")
+    bg  = rolling_background(intensity)
+    net = intensity - bg
+    print(f"  Background range: {bg.min():.0f} – {bg.max():.0f} counts")
+
+    print("\n[3] Peak detection & feature extraction...")
+    df_pk, peaks = extract_peak_features(two_theta, intensity, bg, step)
+
+    print("\n[4] Labeling peaks...")
+    df_pk = label_peaks(df_pk)
+
+    print("\n[5] Training ML models...")
+    results, best_name, le, scaler = train_models(df_pk)
+    best_model = results[best_name]['model']
+
+    print("\n[6] Single peak prediction demo...")
+    sample_measurement = {
+        'peak_position_2theta':   36.26,
+        'peak_intensity_counts':  28299,
+        'net_intensity':          24500,
+        'fwhm_deg':               0.406,
+        'd_spacing_angstrom':     2.475,
+        'crystallite_size_nm':    2056.9,
+        'lattice_strain_epsilon': 0.0333,
+        'peak_asymmetry':         0.001,
+        'texture_coefficient':    9.43,
+        'integral_breadth':       0.432,
+        'snr':                    45.2,
+    }
+    predict_sample(best_model, scaler, le, sample_measurement)
+
+    print("\n[7] Generating plots...")
+    plot_results(two_theta, intensity, bg, peaks, df_pk,
+                 results, best_name, le, scaler)
+
+    # Save peak features to CSV for inspection
+    df_pk.to_csv('xrd_peaks_features.csv', index=False)
+    print("\n  Features saved: xrd_peaks_features.csv")
+    print("\nDone.")
